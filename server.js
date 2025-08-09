@@ -1,73 +1,56 @@
-const express = require('express');
-const WebSocket = require('ws');
-const http = require('http');
-const url = require('url');
+// server.js
+import express from "express";
+import fs from "fs";
+import path from "path";
+import cors from "cors";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-
-let androidSocket = null; // Store connected Android device socket
-
-// When Android app connects via WebSocket
-wss.on('connection', (ws, req) => {
-    console.log('Device connected via WebSocket');
-    androidSocket = ws;
-
-    ws.on('close', () => {
-        console.log('Device disconnected');
-        androidSocket = null;
-    });
-});
-
-// Public endpoint to get file list
-app.get('/files', (req, res) => {
-    if (!androidSocket) {
-        return res.status(503).send({ error: "Device offline" });
-    }
-
-    // Ask Android app for file list
-    androidSocket.once('message', (message) => {
-        try {
-            const files = JSON.parse(message);
-            res.json(files);
-        } catch (err) {
-            res.status(500).send({ error: "Invalid file list format" });
-        }
-    });
-
-    androidSocket.send(JSON.stringify({ action: "getFiles" }));
-});
-
-// Public endpoint to download a file
-app.get('/download', (req, res) => {
-    if (!androidSocket) {
-        return res.status(503).send({ error: "Device offline" });
-    }
-
-    const filePath = req.query.path;
-    if (!filePath) {
-        return res.status(400).send({ error: "File path required" });
-    }
-
-    // Stream file data from Android app
-    res.writeHead(200, {
-        'Content-Type': 'application/octet-stream',
-        'Content-Disposition': `attachment; filename="${filePath.split('/').pop()}"`
-    });
-
-    androidSocket.send(JSON.stringify({ action: "downloadFile", path: filePath }));
-
-    androidSocket.on('message', (chunk) => {
-        if (chunk === '__END__') {
-            res.end();
-        } else {
-            res.write(chunk);
-        }
-    });
-});
-
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Relay server running on port ${PORT}`);
+
+// Enable CORS
+app.use(cors());
+
+// Directory to serve files from (change this later to your target directory)
+const FILES_DIR = path.join(__dirname, "files");
+
+// Ensure files folder exists
+if (!fs.existsSync(FILES_DIR)) {
+    fs.mkdirSync(FILES_DIR);
+    fs.writeFileSync(path.join(FILES_DIR, "example.txt"), "This is a test file.");
+}
+
+// List all files (JSON)
+app.get("/files", (req, res) => {
+    fs.readdir(FILES_DIR, (err, files) => {
+        if (err) {
+            return res.status(500).json({ error: "Unable to list files" });
+        }
+        res.json(files);
+    });
+});
+
+// Download specific file
+app.get("/download/:filename", (req, res) => {
+    const filePath = path.join(FILES_DIR, req.params.filename);
+    if (fs.existsSync(filePath)) {
+        res.download(filePath);
+    } else {
+        res.status(404).json({ error: "File not found" });
+    }
+});
+
+// Root route
+app.get("/", (req, res) => {
+    res.send(`
+        <h1>File Server</h1>
+        <p>Use <a href="/files">/files</a> to see file list</p>
+    `);
+});
+
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });
