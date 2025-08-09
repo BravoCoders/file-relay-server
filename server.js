@@ -1,133 +1,112 @@
 import express from "express";
-import fs from "fs";
-import path from "path";
+import http from "http";
+import WebSocket, { WebSocketServer } from "ws";
 import cors from "cors";
-import { fileURLToPath } from "url";
-import { WebSocketServer } from "ws";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Enable CORS
 app.use(cors());
 
-// Directory to serve files from - change this to your desired folder
-const FILES_DIR = path.join(__dirname, "files");
-
-// Ensure files folder exists and create example.txt if missing
-if (!fs.existsSync(FILES_DIR)) {
-    fs.mkdirSync(FILES_DIR, { recursive: true });
-}
-const examplePath = path.join(FILES_DIR, "example.txt");
-if (!fs.existsSync(examplePath)) {
-    fs.writeFileSync(examplePath, "This is a test file.");
-}
-
-// HTTP endpoints for browser or HTTP clients (optional)
 app.get("/", (req, res) => {
-    res.send(`
-        <h1>File Server</h1>
-        <p>Use <a href="/files">/files</a> to see file list</p>
-    `);
+  res.send("File relay server running");
 });
 
-app.get("/files", (req, res) => {
-    fs.readdir(FILES_DIR, (err, files) => {
-        if (err) return res.status(500).json({ error: "Unable to list files" });
-        res.json(files);
-    });
-});
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws" });
 
-app.get("/download/:filename", (req, res) => {
-    const filePath = path.join(FILES_DIR, req.params.filename);
-    if (fs.existsSync(filePath)) {
-        res.download(filePath);
-    } else {
-        res.status(404).json({ error: "File not found" });
-    }
-});
+let hostClient = null; // The Android device connection
+const clients = new Set();
 
-const server = app.listen(PORT, () => {
-    console.log(`HTTP server running on port ${PORT}`);
-});
+wss.on("connection", (ws, req) => {
+  console.log("New WS connection");
 
-// WebSocket server attached to the same HTTP server
-const wss = new WebSocketServer({ server });
+  ws.isHost = false;
+  ws.isClient = false;
+  ws.pendingRequests = new Map(); // Map reqId => original client WS (for host only)
 
-console.log("WebSocket server created");
+  ws.on("message", (data) => {
+    try {
+      const msg = data.toString();
 
-wss.on("connection", (ws) => {
-    console.log("WebSocket client connected");
+      // Try parse JSON message from clients/host
+      let obj = null;
+      try {
+        obj = JSON.parse(msg);
+      } catch {}
 
-    ws.on("message", async (data) => {
-        // Expecting JSON text commands from clients
-        try {
-            const msg = data.toString();
-            const obj = JSON.parse(msg);
+      // Protocol: client connects first and sends {"type":"client"} or {"type":"host"}
+      if (obj && obj.type === "host" && !hostClient) {
+        ws.isHost = true;
+        hostClient = ws;
+        console.log("Registered host client");
+        return;
+      }
+      if (obj && obj.type === "client") {
+        ws.isClient = true;
+        clients.add(ws);
+        console.log("Registered client");
+        return;
+      }
 
-            if (obj.action === "getFiles") {
-                const files = await getFilesList();
-                ws.send(JSON.stringify(files));
-            } else if (obj.action === "downloadFile" && obj.path) {
-                const reqId = obj.reqId || Date.now().toString();
-                streamFileInChunks(ws, obj.path, reqId);
+      // If message is from a client and wants files or download, forward to host
+      if (ws.isClient && hostClient) {
+        // Attach the client WS so we can send back response later
+        const reqId = obj.reqId || Date.now().toString();
+        // Save mapping of reqId -> ws client on host connection
+        hostClient.pendingRequests.set(reqId, ws);
+
+        // Forward to host with reqId (so host can send response tagged with it)
+        const forwardMsg = JSON.stringify({ ...obj, reqId });
+        hostClient.send(forwardMsg);
+        console.log(`Forwarded request ${obj.action} to host`);
+        return;
+      }
+
+      // If message is from host, forward response back to requesting client
+      if (ws.isHost) {
+        // The host will send base64 chunks or JSON with reqId
+
+        // Expect format: either JSON with reqId or string starting with reqId:
+        if (obj && obj.reqId) {
+          const clientWs = ws.pendingRequests.get(obj.reqId);
+          if (clientWs && clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(data);
+          }
+          // Optionally remove mapping if this is last chunk? Depends on your protocol
+          // Leave removal to client side or implement heartbeat if needed
+        } else if (typeof msg === "string") {
+          // Check if message starts with reqId:chunkBase64 or __END__:reqId
+          const sepIndex = msg.indexOf(":");
+          if (sepIndex > 0) {
+            const reqId = msg.substring(0, sepIndex);
+            const clientWs = ws.pendingRequests.get(reqId);
+            if (clientWs && clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(msg);
             }
-        } catch (err) {
-            console.error("Failed to process WS message:", err);
+          }
         }
-    });
+        return;
+      }
+    } catch (err) {
+      console.error("Error handling WS message:", err);
+    }
+  });
 
-    ws.on("close", () => {
-        console.log("WebSocket client disconnected");
-    });
+  ws.on("close", () => {
+    console.log("WS connection closed");
+
+    if (ws.isHost) {
+      hostClient = null;
+      ws.pendingRequests.clear();
+      console.log("Host client disconnected");
+    }
+    if (ws.isClient) {
+      clients.delete(ws);
+    }
+  });
 });
 
-async function getFilesList() {
-    return new Promise((resolve, reject) => {
-        fs.readdir(FILES_DIR, { withFileTypes: true }, (err, files) => {
-            if (err) return reject(err);
-            const arr = files.map((file) => {
-                const fullPath = path.join(FILES_DIR, file.name);
-                return {
-                    path: fullPath,
-                    name: file.isDirectory() ? file.name + "/" : file.name,
-                    isDir: file.isDirectory(),
-                    size: file.isFile() ? fs.statSync(fullPath).size : 0,
-                    lastModified: fs.statSync(fullPath).mtimeMs
-                };
-            });
-            resolve(arr);
-        });
-    });
-}
-
-function streamFileInChunks(ws, filePath, reqId) {
-    // Only allow files within FILES_DIR for security
-    if (!filePath.startsWith(FILES_DIR)) {
-        ws.send(JSON.stringify({ error: "Access denied" }));
-        return;
-    }
-    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
-        ws.send(JSON.stringify({ error: "File not found" }));
-        return;
-    }
-
-    const CHUNK_SIZE = 64 * 1024; // 64 KB
-    const stream = fs.createReadStream(filePath, { highWaterMark: CHUNK_SIZE });
-
-    stream.on("data", (chunk) => {
-        const base64Chunk = chunk.toString("base64");
-        ws.send(`${reqId}:${base64Chunk}`);
-    });
-
-    stream.on("end", () => {
-        ws.send(`__END__:${reqId}`);
-    });
-
-    stream.on("error", (err) => {
-        ws.send(JSON.stringify({ error: "Read error", details: err.message }));
-    });
-}
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
